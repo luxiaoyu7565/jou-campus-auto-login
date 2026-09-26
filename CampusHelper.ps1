@@ -42,11 +42,44 @@ function Get-Password($Config) {
     finally{[Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ptr);$secure.Dispose()}
 }
 function Set-Autostart([bool]$Enabled) {
+    $scheduler=New-Object -ComObject 'Schedule.Service'
+    $scheduler.Connect()
+    $folder=$scheduler.GetFolder('\')
     if($Enabled){
         $exe=Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-        $command='"'+$exe+'" -NoProfile -STA -WindowStyle Hidden -ExecutionPolicy Bypass -File "'+$EntryPath+'" -Background'
-        [void](New-ItemProperty -Path $RunKey -Name $TaskName -Value $command -PropertyType String -Force)
-    } else {Remove-ItemProperty -Path $RunKey -Name $TaskName -ErrorAction SilentlyContinue}
+        $userSid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+        $task=$scheduler.NewTask(0)
+        $task.RegistrationInfo.Description='江苏海洋大学校园网自动登录：用户登录后立即启动。'
+        $task.Principal.UserId=$userSid
+        $task.Principal.LogonType=3 # Current interactive user; no Windows password stored.
+        $task.Principal.RunLevel=0
+        $trigger=$task.Triggers.Create(9) # User logon.
+        $trigger.UserId=$userSid
+        $trigger.Delay='PT0S'
+        $action=$task.Actions.Create(0)
+        $action.Path=$exe
+        $action.Arguments='-NoProfile -STA -WindowStyle Hidden -ExecutionPolicy Bypass -File "'+$EntryPath+'" -Background'
+        $action.WorkingDirectory=Split-Path -Parent $EntryPath
+        $task.Settings.Enabled=$true
+        $task.Settings.StartWhenAvailable=$true
+        $task.Settings.DisallowStartIfOnBatteries=$false
+        $task.Settings.StopIfGoingOnBatteries=$false
+        $task.Settings.RunOnlyIfNetworkAvailable=$false
+        $task.Settings.RunOnlyIfIdle=$false
+        $task.Settings.ExecutionTimeLimit='PT0S'
+        $task.Settings.MultipleInstances=2
+        $task.Settings.Priority=5
+        $task.Settings.RestartInterval='PT1M'
+        $task.Settings.RestartCount=3
+        [void]$folder.RegisterTaskDefinition($TaskName,$task,6,$userSid,$null,3,$null)
+        # Remove the delayed Run entry only after successful task registration.
+        Remove-ItemProperty -Path $RunKey -Name $TaskName -ErrorAction SilentlyContinue
+    } else {
+        foreach($registered in $folder.GetTasks(1)){
+            if($registered.Name -eq $TaskName){$registered.Enabled=$false}
+        }
+        Remove-ItemProperty -Path $RunKey -Name $TaskName -ErrorAction SilentlyContinue
+    }
 }
 function Get-WebText([string]$Url) {
     $uri=[uri]$Url
@@ -233,6 +266,7 @@ try {
     try{$owned=$mutex.WaitOne(0)}catch [Threading.AbandonedMutexException]{$owned=$true}
     if(-not $owned){$mutex.Dispose();exit 0}
     try {
+        Write-Status '后台已启动，正在检查校园网。'
         $failures=0;$lastConfig='';$lastStatus=''
         do {
             $delay=30
@@ -246,7 +280,11 @@ try {
                 elseif($failures -ge 3){$message='认证失败三次，已暂停重试。请检查账号、密码和运营商后重新保存。';$delay=60}
                 elseif(Invoke-Login $config $context){$message='已自动登录校园网。';$failures=0}
                 else{$failures++;$message='认证未成功，请检查账号、密码和运营商；五分钟后重试。';$delay=300}
-            }catch{$message='暂未就绪：'+$_.Exception.Message;$delay=60}
+            }catch{
+                $message='暂未就绪：'+$_.Exception.Message
+                if($message -match '校园网服务器暂时不可达|尚未连接到可认证的校园网'){$delay=5}
+                else{$delay=30}
+            }
             if($message -ne $lastStatus){Write-Status $message;$lastStatus=$message}
             if($Once){break}
             Start-Sleep -Seconds $delay
